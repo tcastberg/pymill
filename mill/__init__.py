@@ -57,8 +57,8 @@ class Mill:
         """Connect to Mill."""
         url = API_ENDPOINT + '/share/applyAuthCode'
         headers = {
-            "access_key": self.access_key,
-            "secret_token": self.secret_token
+            "access_key": self._access_key,
+            "secret_token": self._secret_token
         }
         try:
             with async_timeout.timeout(self._timeout):
@@ -68,22 +68,21 @@ class Mill:
             _LOGGER.error("Error connecting to Mill: %s", err)
             return False
 
-        result = await resp
-
-        if 'errorCode' in result.json():
-            if data['errorCode'] == 101:
+        body = await resp.json()
+        if 'errorCode' in body:
+            if body['errorCode'] == 101:
                 _LOGGER.error("Remote system error")
                 return None
-            if data['errorCode'] == 102:
+            if body['errorCode'] == 102:
                 _LOGGER.error("UDS error")
                 return None
-            if result.json()['errorCode'] == 201:
+            if body['errorCode'] == 201:
                 _LOGGER.error('Wrong access key')
                 return False
 
-        if result.status == 200 and json.loads(result.text())['success'] == True:
-            if 'authorization_code' in result.headers:
-                self._authorization_code = result.headers['authorization_code']
+        if resp.status == 200 and body['success'] == True:
+            if 'authorization_code' in resp.headers:
+                self._authorization_code = resp.headers['authorization_code']
                 return True
         return False
 
@@ -95,8 +94,8 @@ class Mill:
             'authorization_code': self._authorization_code
         }
         params = {
-            'username': self.username,
-            'password': self.password
+            'username': self._username,
+            'password': self._password
         }
         try:
             with async_timeout.timeout(self._timeout):
@@ -107,37 +106,37 @@ class Mill:
             _LOGGER.error("Error connecting to Mill: %s", err)
             return False
 
-        result = await resp
-        if 'errorCode' in result.json():
-            if data['errorCode'] == 101:
+        body = await resp.json()
+        if 'errorCode' in body:
+            if body['errorCode'] == 101:
                 _LOGGER.error("Remote system error")
                 return None
-            if data['errorCode'] == 102:
+            if body['errorCode'] == 102:
                 _LOGGER.error("UDS error")
                 return None
-            if result.json()['errorCode'] == 221:
+            if body['errorCode'] == 221:
                 _LOGGER.error('User does not exist')
                 return False
-            if result.json()['errorCode'] == 222:
+            if body['errorCode'] == 222:
                 _LOGGER.error('Authorization_code is invalid')
                 return False
-            if result.json()['errorCode'] == 223:
+            if body['errorCode'] == 223:
                 _LOGGER.error('Application account has lapsed')
                 return False
 
-        if result.status == 200 and result.json()['success']:
-            data = result.json()['data']
+        if resp.status == 200 and body['success']:
+            data = body['data']
             if 'access_token' in data:
-                self.access_token = data['access_token']
+                self._access_token = data['access_token']
                 _LOGGER.debug('Got access token: ', self._access_token)
             if 'refresh_token' in data:
-                self.refresh_token = data['refresh_token']
+                self._refresh_token = data['refresh_token']
                 _LOGGER.debug('Got refresh token: ', self._refresh_token)
             if 'expireTime' in data:
-                self.token_expiry = dt.datetime.fromtimestamp(float(data['expireTime'])/1000)
+                self._token_expiry = dt.datetime.fromtimestamp(float(data['expireTime'])/1000)
                 _LOGGER.debug('Got token expiry: ', self._token_expiry)
             if 'refresh_expireTime' in data:
-                self.refresh_expiry = dt.datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
+                self._refresh_expiry = dt.datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
                 _LOGGER.debug('Got refresh expiry: %s', self._refresh_expiry)
             return True
         return False
@@ -165,16 +164,16 @@ class Mill:
         if not self._access_token:
             raise Exception('Not connected')
 
-        if (self._token_expiry - datetime.now()).seconds > 7200:
+        if (self._token_expiry - dt.datetime.now()).seconds > 7200:
             return self._access_token
 
-        if (self.refresh_expiry - datetime.now()).seconds < 0:
+        if (self._refresh_expiry - dt.datetime.now()).seconds < 0:
             _LOGGER.debug("Refresh token expired, reauthenticating")
             self.sync_connect()
             return self._access_token
 
         url = API_ENDPOINT + '/share/refreshtoken'
-        params = {'refreshtoken': self.refresh_token}
+        params = {'refreshtoken': self._refresh_token}
         try:
             with async_timeout.timeout(self._timeout):
                 resp = await self.websession.post(url,
@@ -183,28 +182,26 @@ class Mill:
             _LOGGER.error("Error connecting to Mill: %s", err)
             return None
 
-        result = await resp
-
-        data = result.json()['data']
-        if 'errorCode' in result.json():
-            if data['errorCode'] == 101:
+        body = await resp.json()
+        if 'errorCode' in body:
+            if body['errorCode'] == 101:
                 _LOGGER.error("Remote system error")
                 return None
-            if data['errorCode'] == 102:
+            if body['errorCode'] == 102:
                 _LOGGER.error("UDS error")
                 return None
-            if data['errorCode'] == 241:
+            if body['errorCode'] == 241:
                 _LOGGER.error("Refresh token is wrong or expired")
                 return None
-            if data['errorCode'] == 242:
+            if body['errorCode'] == 242:
                 _LOGGER.error("Refresh token is wrong")
                 return None
-            if data['errorCode'] == 243:
+            if body['errorCode'] == 243:
                 _LOGGER.error("Application account has lapsed")
                 return None
 
-        if result.status_code == 200 and result.json()['success']:
-            data = result.json()['data']
+        if resp.status == 200 and body['success']:
+            data = body['data']
             if 'access_token' in data:
                 self._access_token = data['access_token']
                 _LOGGER.debug('Got access token: %s', self._access_token)
@@ -212,10 +209,10 @@ class Mill:
                 self._refresh_token = data['refresh_token']
                 _LOGGER.debug('Got refresh token: %s', self._refresh_token)
             if 'expireTime' in data:
-                self._token_expiry = datetime.fromtimestamp(float(data['expireTime'])/1000)
+                self._token_expiry = dt.datetime.fromtimestamp(float(data['expireTime'])/1000)
                 _LOGGER.debug('Got token expiry: %s', self._token_expiry)
             if 'refresh_expireTime' in data:
-                self._refresh_expiry = datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
+                self._refresh_expiry = dt.datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
                 _LOGGER.debug('Got refresh expiry: %s', self._refresh_expiry)
             return self._access_token
         return None
@@ -228,36 +225,33 @@ class Mill:
 
         url = API_ENDPOINT + path
         headers = {
-                   'access_token': self.token()
+                   'access_token': await self.token()
         }
         try:
             with async_timeout.timeout(self._timeout):
                 resp = await self.websession.post(url,
                                                   headers=headers,
-                                                  data=json.dumps(payload))
+                                                  params=payload)
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.error("Error sending command to Mill: %s, %s", command, err)
             return None
 
-        result = await resp
 
-        _LOGGER.debug(result.text())
-
-        data = result.json()['data']
-        if 'errorCode' in result.json():
-            if data['errorCode'] == 101:
+        body = await resp.json()
+        if 'errorCode' in body:
+            if body['errorCode'] == 101:
                 _LOGGER.error("Remote system error")
                 return None
-            if data['errorCode'] == 102:
+            if body['errorCode'] == 102:
                 _LOGGER.error("UDS error")
                 return None
-            if data['errorCode'] == 303:
+            if body['errorCode'] == 303:
                 _LOGGER.error("The device is not yours")
                 return None
-            if data['errorCode'] == 304:
+            if body['errorCode'] == 304:
                 _LOGGER.error("Cannot find device info")
                 return None
-        return data
+        return body['data']
 
     async def get_home_list(self):
         """Request data."""
@@ -273,9 +267,9 @@ class Mill:
         if homes is None:
             return None
         for home in homes:
-            payload = {"homeId": home.get("homeId"), "timeZoneNum": "+01:00"}
+            payload = {"homeId": home.get("homeId")}
             data = await self.request("/uds/selectRoombyHome", payload)
-            rooms = data.get('roomInfo', [])
+            rooms = data.get('roomList', [])
             if not rooms:
                 continue
             for _room in rooms:
@@ -336,25 +330,29 @@ class Mill:
         for home in homes:
             payload = {"homeId": home.get("homeId")}
             data = await self.request("/uds/getIndependentDevices", payload)
-            heaters.append(data.get('deviceInfo', []))
+            heaters.extend(data.get('deviceInfoList', []))
         for room in self.rooms.keys():
             payload = {"roomId": room}
             data = await self.request("/uds/selectDevicebyRoom", payload)
-            heaters.append(data.get('deviceInfo', []))
-        if not heaters:
-            continue
-        for _heater in heaters:
-            _id = _heater.get('deviceId')
-            heater = self.heaters.get(_id, Heater())
-            heater.device_id = _id
-            heater.current_temp = _heater.get('currentTemp')
-            heater.device_status = _heater.get('deviceStatus')
-            heater.name = _heater.get('deviceName')
-            heater.fan_status = _heater.get('fanStatus')
-            heater.set_temp = _heater.get('holidayTemp')
-            heater.power_status = _heater.get('powerStatus')
+            heaters.extend(data.get('deviceList', []))
+        if heaters:
+            for _heater in heaters:
+                if not _heater:
+                    continue
+                _id = _heater.get('deviceId')
+                heater = self.heaters.get(_id, Heater())
+                heater.device_id = _id
+                heater.current_temp = _heater.get('currentTemp')
+                heater.device_status = _heater.get('deviceStatus')
+                heater.name = _heater.get('deviceName')
+                heater.flag = _heater.get('heaterFlag')
+                heater.control_type = _heater.get('controlType')
+                heater.can_change_temp = _heater.get('canChangeTemp')
+                #heater.fan_status = _heater.get('fanStatus')
+                #heater.set_temp = _heater.get('holidayTemp')
+                #heater.power_status = _heater.get('powerStatus')
 
-            self.heaters[_id] = heater
+                self.heaters[_id] = heater
 
     def sync_update_heaters(self):
         """Request data."""
