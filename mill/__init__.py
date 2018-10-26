@@ -14,8 +14,7 @@ import aiohttp
 import async_timeout
 
 
-API_ENDPOINT_1 = 'https://eurouter.ablecloud.cn:9005/zc-account/v1'
-API_ENDPOINT_2 = 'http://eurouter.ablecloud.cn:5000/millService/v1'
+API_ENDPOINT = 'https://api.millheat.com'
 DEFAULT_TIMEOUT = 10
 MIN_TIME_BETWEEN_UPDATES = dt.timedelta(seconds=10)
 REQUEST_TIMEOUT = '300'
@@ -28,7 +27,7 @@ class Mill:
     """Class to comunicate with the Mill api."""
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, username, password,
+    def __init__(self, access_key, secret_token, username, password,
                  timeout=DEFAULT_TIMEOUT,
                  websession=None):
         """Initialize the Mill connection."""
@@ -40,64 +39,120 @@ class Mill:
         else:
             self.websession = websession
         self._timeout = timeout
+        self._access_key = access_key
+        self._secret_token = secret_token
         self._username = username
         self._password = password
+        self._authorization_code = None
         self._user_id = None
-        self._token = None
+        self._access_token = None
+        self._token_expiry = None
+        self._refresh_token = None
+        self._refresh_expiry = None
         self.rooms = {}
         self.heaters = {}
         self._throttle_time = None
 
-    async def connect(self):
+    async def retrieve_authorization_code(self):
         """Connect to Mill."""
-        url = API_ENDPOINT_1 + '/login'
+        url = API_ENDPOINT + '/share/applyAuthCode'
         headers = {
-            "Content-Type": "application/x-zc-object",
-            "Connection": "Keep-Alive",
-            "X-Zc-Major-Domain": "seanywell",
-            "X-Zc-Msg-Name": "millService",
-            "X-Zc-Sub-Domain": "milltype",
-            "X-Zc-Seq-Id": "1",
-            "X-Zc-Version": "1",
+            "access_key": self.access_key,
+            "secret_token": self.secret_token
         }
-        payload = {"account": self._username,
-                   "password": self._password}
         try:
             with async_timeout.timeout(self._timeout):
                 resp = await self.websession.post(url,
-                                                  data=json.dumps(payload),
                                                   headers=headers)
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.error("Error connecting to Mill: %s", err)
             return False
 
-        result = await resp.text()
-        if '"errorCode":3504' in result:
-            _LOGGER.error('Wrong password')
+        result = await resp
+
+        if 'errorCode' in result.json():
+            if data['errorCode'] == 101:
+                _LOGGER.error("Remote system error")
+                return None
+            if data['errorCode'] == 102:
+                _LOGGER.error("UDS error")
+                return None
+            if result.json()['errorCode'] == 201:
+                _LOGGER.error('Wrong access key')
+                return False
+
+        if result.status == 200 and json.loads(result.text())['success'] == True:
+            if 'authorization_code' in result.headers:
+                self._authorization_code = result.headers['authorization_code']
+                return True
+        return False
+
+
+    async def retrieve_access_token(self):
+        """Connect to Mill."""
+        url = API_ENDPOINT + '/share/applyAccessToken'
+        headers = {
+            'authorization_code': self._authorization_code
+        }
+        params = {
+            'username': self.username,
+            'password': self.password
+        }
+        try:
+            with async_timeout.timeout(self._timeout):
+                resp = await self.websession.post(url,
+                                                  headers=headers,
+                                                  params=params)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.error("Error connecting to Mill: %s", err)
             return False
 
-        if '"errorCode":3501' in result:
-            _LOGGER.error('Account does not exist')
-            return False
+        result = await resp
+        if 'errorCode' in result.json():
+            if data['errorCode'] == 101:
+                _LOGGER.error("Remote system error")
+                return None
+            if data['errorCode'] == 102:
+                _LOGGER.error("UDS error")
+                return None
+            if result.json()['errorCode'] == 221:
+                _LOGGER.error('User does not exist')
+                return False
+            if result.json()['errorCode'] == 222:
+                _LOGGER.error('Authorization_code is invalid')
+                return False
+            if result.json()['errorCode'] == 223:
+                _LOGGER.error('Application account has lapsed')
+                return False
 
-        data = json.loads(result)
-        token = data.get('token')
-        if token is None:
-            _LOGGER.error('No token')
-            return False
-
-        self._token = token
-        self._user_id = data.get('userId')
-        return True
+        if result.status == 200 and result.json()['success']:
+            data = result.json()['data']
+            if 'access_token' in data:
+                self.access_token = data['access_token']
+                _LOGGER.debug('Got access token: ', self._access_token)
+            if 'refresh_token' in data:
+                self.refresh_token = data['refresh_token']
+                _LOGGER.debug('Got refresh token: ', self._refresh_token)
+            if 'expireTime' in data:
+                self.token_expiry = dt.datetime.fromtimestamp(float(data['expireTime'])/1000)
+                _LOGGER.debug('Got token expiry: ', self._token_expiry)
+            if 'refresh_expireTime' in data:
+                self.refresh_expiry = dt.datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
+                _LOGGER.debug('Got refresh expiry: %s', self._refresh_expiry)
+            return True
+        return False
 
     def sync_connect(self):
-        """Close the Mill connection."""
+        """Initiate the Mill connection."""
         loop = asyncio.get_event_loop()
-        task = loop.create_task(self.connect())
+        task = loop.create_task(self.retrieve_authorization_code())
+        loop.run_until_complete(task)
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(self.retrieve_access_token())
         loop.run_until_complete(task)
 
     async def close_connection(self):
-        """Close the Mill connection."""
+        """Terminate the Mill connection."""
         await self.websession.close()
 
     def sync_close_connection(self):
@@ -106,79 +161,107 @@ class Mill:
         task = loop.create_task(self.close_connection())
         loop.run_until_complete(task)
 
-    async def request(self, command, payload, retry=2):
+    async def token(self):
+        if not self._access_token:
+            raise Exception('Not connected')
+
+        if (self._token_expiry - datetime.now()).seconds > 7200:
+            return self._access_token
+
+        if (self.refresh_expiry - datetime.now()).seconds < 0:
+            _LOGGER.debug("Refresh token expired, reauthenticating")
+            self.sync_connect()
+            return self._access_token
+
+        url = API_ENDPOINT + '/share/refreshtoken'
+        params = {'refreshtoken': self.refresh_token}
+        try:
+            with async_timeout.timeout(self._timeout):
+                resp = await self.websession.post(url,
+                                                  params=params)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.error("Error connecting to Mill: %s", err)
+            return None
+
+        result = await resp
+
+        data = result.json()['data']
+        if 'errorCode' in result.json():
+            if data['errorCode'] == 101:
+                _LOGGER.error("Remote system error")
+                return None
+            if data['errorCode'] == 102:
+                _LOGGER.error("UDS error")
+                return None
+            if data['errorCode'] == 241:
+                _LOGGER.error("Refresh token is wrong or expired")
+                return None
+            if data['errorCode'] == 242:
+                _LOGGER.error("Refresh token is wrong")
+                return None
+            if data['errorCode'] == 243:
+                _LOGGER.error("Application account has lapsed")
+                return None
+
+        if result.status_code == 200 and result.json()['success']:
+            data = result.json()['data']
+            if 'access_token' in data:
+                self._access_token = data['access_token']
+                _LOGGER.debug('Got access token: %s', self._access_token)
+            if 'refresh_token' in data:
+                self._refresh_token = data['refresh_token']
+                _LOGGER.debug('Got refresh token: %s', self._refresh_token)
+            if 'expireTime' in data:
+                self._token_expiry = datetime.fromtimestamp(float(data['expireTime'])/1000)
+                _LOGGER.debug('Got token expiry: %s', self._token_expiry)
+            if 'refresh_expireTime' in data:
+                self._refresh_expiry = datetime.fromtimestamp(float(data['refresh_expireTime'])/1000)
+                _LOGGER.debug('Got refresh expiry: %s', self._refresh_expiry)
+            return self._access_token
+        return None
+
+    async def request(self, path, payload=None, retry=2):
         """Request data."""
         # pylint: disable=too-many-return-statements
 
-        if self._token is None:
-            _LOGGER.error("No token")
-            return
-
         _LOGGER.debug(payload)
 
-        nonce = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(16))
-        url = API_ENDPOINT_2 + command
-        timestamp = int(time.time())
-        signature = hashlib.sha1(str(REQUEST_TIMEOUT
-                                     + str(timestamp)
-                                     + nonce
-                                     + self._token).encode("utf-8")).hexdigest()
-
+        url = API_ENDPOINT + path
         headers = {
-            "Content-Type": "application/x-zc-object",
-            "Connection": "Keep-Alive",
-            "X-Zc-Major-Domain": "seanywell",
-            "X-Zc-Msg-Name": "millService",
-            "X-Zc-Sub-Domain": "milltype",
-            "X-Zc-Seq-Id": "1",
-            "X-Zc-Version": "1",
-            "X-Zc-Timestamp": str(timestamp),
-            "X-Zc-Timeout": REQUEST_TIMEOUT,
-            "X-Zc-Nonce": nonce,
-            "X-Zc-User-Id": str(self._user_id),
-            "X-Zc-User-Signature": signature,
-            "X-Zc-Content-Length": str(len(payload)),
+                   'access_token': self.token()
         }
         try:
             with async_timeout.timeout(self._timeout):
                 resp = await self.websession.post(url,
-                                                  data=json.dumps(payload),
-                                                  headers=headers)
+                                                  headers=headers,
+                                                  data=json.dumps(payload))
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.error("Error sending command to Mill: %s, %s", command, err)
             return None
 
-        result = await resp.text()
+        result = await resp
 
-        _LOGGER.debug(result)
+        _LOGGER.debug(result.text())
 
-        if not result or result == '{"errorCode":0}':
-            return None
-
-        if 'access token expire' in result:
-            if retry < 1:
+        data = result.json()['data']
+        if 'errorCode' in result.json():
+            if data['errorCode'] == 101:
+                _LOGGER.error("Remote system error")
                 return None
-            if not await self.connect():
+            if data['errorCode'] == 102:
+                _LOGGER.error("UDS error")
                 return None
-            return await self.request(command, payload, retry-1)
-
-        if '"error":"device offline"' in result:
-            if retry < 1:
-                _LOGGER.error("Failed to send request, %s", result)
+            if data['errorCode'] == 303:
+                _LOGGER.error("The device is not yours")
                 return None
-            _LOGGER.error("Failed to send request, %s. Retrying...", result)
-            return await self.request(command, payload, retry-1)
-
-        if 'errorCode' in result:
-            _LOGGER.error("Failed to send request, %s", result)
-            return None
-
-        data = json.loads(result)
+            if data['errorCode'] == 304:
+                _LOGGER.error("Cannot find device info")
+                return None
         return data
 
     async def get_home_list(self):
         """Request data."""
-        resp = await self.request("/selectHomeList", "{}")
+        resp = await self.request("/uds/selectHomeList")
         if resp is None:
             return None
         homes = resp.get('homeList')
@@ -191,7 +274,7 @@ class Mill:
             return None
         for home in homes:
             payload = {"homeId": home.get("homeId"), "timeZoneNum": "+01:00"}
-            data = await self.request("/selectRoombyHome", payload)
+            data = await self.request("/uds/selectRoombyHome", payload)
             rooms = data.get('roomInfo', [])
             if not rooms:
                 continue
@@ -214,59 +297,64 @@ class Mill:
         task = loop.create_task(self.update_rooms())
         loop.run_until_complete(task)
 
-    async def set_room_temperatures(self, room_id, sleep_temp=None,
-                                    comfort_temp=None, away_temp=None):
-        """Set room temps."""
-        room = self.rooms.get(room_id)
-        if room is None:
-            _LOGGER.error("No such device")
-            return
-        if sleep_temp is None:
-            sleep_temp = room.sleep_temp
-        if away_temp is None:
-            away_temp = room.away_temp
-        if comfort_temp is None:
-            comfort_temp = room.comfort_temp
-        payload = {"roomId": room_id,
-                   "sleepTemp": sleep_temp,
-                   "comfortTemp": comfort_temp,
-                   "awayTemp": away_temp,
-                   "homeType": 0}
-        await self.request("/changeRoomModeTempInfo", payload)
+    # async def set_room_temperatures(self, room_id, sleep_temp=None,
+    #                                 comfort_temp=None, away_temp=None):
+    #     """Set room temps."""
+    #     room = self.rooms.get(room_id)
+    #     if room is None:
+    #         _LOGGER.error("No such device")
+    #         return
+    #     if sleep_temp is None:
+    #         sleep_temp = room.sleep_temp
+    #     if away_temp is None:
+    #         away_temp = room.away_temp
+    #     if comfort_temp is None:
+    #         comfort_temp = room.comfort_temp
+    #     payload = {"roomId": room_id,
+    #                "sleepTemp": sleep_temp,
+    #                "comfortTemp": comfort_temp,
+    #                "awayTemp": away_temp,
+    #                "homeType": 0}
+    #     await self.request("/changeRoomModeTempInfo", payload)
 
-    def sync_set_room_temperatures(self, room_id, sleep_temp=None,
-                                   comfort_temp=None, away_temp=None):
-        """Set heater temps."""
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(self.set_room_temperatures(room_id,
-                                                           sleep_temp,
-                                                           comfort_temp,
-                                                           away_temp))
-        loop.run_until_complete(task)
+    # def sync_set_room_temperatures(self, room_id, sleep_temp=None,
+    #                                comfort_temp=None, away_temp=None):
+    #     """Set heater temps."""
+    #     loop = asyncio.get_event_loop()
+    #     task = loop.create_task(self.set_room_temperatures(room_id,
+    #                                                        sleep_temp,
+    #                                                        comfort_temp,
+    #                                                        away_temp))
+    #     loop.run_until_complete(task)
 
     async def update_heaters(self):
         """Request data."""
         homes = await self.get_home_list()
+        heaters = []
         if homes is None:
             return None
         for home in homes:
             payload = {"homeId": home.get("homeId")}
-            data = await self.request("/getIndependentDevices", payload)
-            heaters = data.get('deviceInfo', [])
-            if not heaters:
-                continue
-            for _heater in heaters:
-                _id = _heater.get('deviceId')
-                heater = self.heaters.get(_id, Heater())
-                heater.device_id = _id
-                heater.current_temp = _heater.get('currentTemp')
-                heater.device_status = _heater.get('deviceStatus')
-                heater.name = _heater.get('deviceName')
-                heater.fan_status = _heater.get('fanStatus')
-                heater.set_temp = _heater.get('holidayTemp')
-                heater.power_status = _heater.get('powerStatus')
+            data = await self.request("/uds/getIndependentDevices", payload)
+            heaters.append(data.get('deviceInfo', []))
+        for room in self.rooms.keys():
+            payload = {"roomId": room}
+            data = await self.request("/uds/selectDevicebyRoom", payload)
+            heaters.append(data.get('deviceInfo', []))
+        if not heaters:
+            continue
+        for _heater in heaters:
+            _id = _heater.get('deviceId')
+            heater = self.heaters.get(_id, Heater())
+            heater.device_id = _id
+            heater.current_temp = _heater.get('currentTemp')
+            heater.device_status = _heater.get('deviceStatus')
+            heater.name = _heater.get('deviceName')
+            heater.fan_status = _heater.get('fanStatus')
+            heater.set_temp = _heater.get('holidayTemp')
+            heater.power_status = _heater.get('powerStatus')
 
-                self.heaters[_id] = heater
+            self.heaters[_id] = heater
 
     def sync_update_heaters(self):
         """Request data."""
@@ -287,46 +375,44 @@ class Mill:
         await self.throttle_update_heaters()
         return self.heaters.get(device_id)
 
-    async def heater_control(self, device_id, fan_status=None,
-                             power_status=None):
-        """Set heater temps."""
-        heater = self.heaters.get(device_id)
-        if heater is None:
-            _LOGGER.error("No such device")
-            return
-        if fan_status is None:
-            fan_status = heater.fan_status
-        if power_status is None:
-            power_status = heater.power_status
-        operation = 0 if fan_status == heater.fan_status else 4
-        payload = {"subDomain": 5332,
-                   "deviceId": device_id,
-                   "testStatus": 1,
-                   "operation": operation,
-                   "status": power_status,
-                   "windStatus": fan_status,
-                   "holdTemp": heater.set_temp,
-                   "tempType": 0,
-                   "powerLevel": 0}
-        await self.request("/deviceControl", payload)
+    # async def heater_control(self, device_id, fan_status=None,
+    #                          power_status=None):
+    #     """Set heater temps."""
+    #     heater = self.heaters.get(device_id)
+    #     if heater is None:
+    #         _LOGGER.error("No such device")
+    #         return
+    #     if fan_status is None:
+    #         fan_status = heater.fan_status
+    #     if power_status is None:
+    #         power_status = heater.power_status
+    #     operation = 0 if fan_status == heater.fan_status else 4
+    #     payload = {"subDomain": 5332,
+    #                "deviceId": device_id,
+    #                "testStatus": 1,
+    #                "operation": operation,
+    #                "status": power_status,
+    #                "windStatus": fan_status,
+    #                "holdTemp": heater.set_temp,
+    #                "tempType": 0,
+    #                "powerLevel": 0}
+    #     await self.request("/uds/deviceControlForOpenApi", payload)
 
-    def sync_heater_control(self, device_id, fan_status=None,
-                            power_status=None):
-        """Set heater temps."""
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(self.heater_control(device_id,
-                                                    fan_status,
-                                                    power_status))
-        loop.run_until_complete(task)
+    # def sync_heater_control(self, device_id, fan_status=None,
+    #                         power_status=None):
+    #     """Set heater temps."""
+    #     loop = asyncio.get_event_loop()
+    #     task = loop.create_task(self.heater_control(device_id,
+    #                                                 fan_status,
+    #                                                 power_status))
+    #     loop.run_until_complete(task)
 
     async def set_heater_temp(self, device_id, set_temp):
         """Set heater temp."""
-        payload = {"homeType": 0,
-                   "timeZoneNum": "+02:00",
-                   "deviceId": device_id,
-                   "value": int(set_temp),
-                   "key": "holidayTemp"}
-        await self.request("/changeDeviceInfo", payload)
+        payload = {"deviceId": device_id,
+                   "holdTemp": int(set_temp),
+                   "operation": 1}
+        await self.request("/uds/deviceControlForOpenApi", payload)
 
     def sync_set_heater_temp(self, device_id, set_temp):
         """Set heater temps."""
